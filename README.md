@@ -13,6 +13,7 @@ ZK Payroll Contracts enable companies to process payroll on-chain while keeping 
 - **Batch Payroll** — Process multiple employees in single transaction
 - **Period Freeze Guard** — Finalized payroll periods are locked against further edits, with an admin-controlled unfreeze path for authorized corrections
 - **Run Expiration** — Prepared-but-unfinalized payroll runs can expire after a configurable window, releasing reserved funds and stopping stale submissions
+- **Role Transfer Acceptance Delay** — A privileged role transfer (admin, treasury owner, admin handover) only becomes active after the pending recipient accepts it *and* the 24h acceptance delay has elapsed (#507)
 - **Operational Guardrails** — Payer account status gate on payment execution (#573), approval timestamp validation on approvals and finalization (#571), a privacy-safe pending obligations query (#572), and opaque receipt reference indexing with deduplicated run lookup (#574)
 - **Compliance Ready** — Selective disclosure for audits via view keys
 - **On-Chain Verification** — Groth16 proof verification on Soroban
@@ -55,6 +56,12 @@ ZK Payroll Contracts enable companies to process payroll on-chain while keeping 
 > **Run lifecycle:** prepared-but-unfinalized runs can expire (#474) — see
 > [docs/run-expiration.md](docs/run-expiration.md) for the expiry policy, the
 > permissionless expiry flow, and SDK guidance.
+>
+> **Role lifecycle:** privileged role transfers require an explicit acceptance
+> from the pending recipient and cannot activate before the acceptance delay
+> elapses (#507) — see
+> [docs/role-transfer-acceptance-delay.md](docs/role-transfer-acceptance-delay.md)
+> for the delay, the privacy-safe status views, and SDK guidance.
 
 ## Prerequisites
 
