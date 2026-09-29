@@ -1,9 +1,9 @@
 //! Admin Handover Integration Tests (#339)
 
-use payroll::{Payroll, PayrollClient};
+use payroll::{Payroll, PayrollClient, ROLE_TRANSFER_ACCEPTANCE_DELAY};
 use proof_verifier::{ProofVerifier, ProofVerifierClient, VerificationKey};
 use salary_commitment::{SalaryCommitmentContract, SalaryCommitmentContractClient};
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::testutils::{Address as _, Ledger as _};
 use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
 use token::Token;
 
@@ -76,7 +76,9 @@ fn test_admin_handover_success_and_role_transfer() {
     assert_eq!(record.current_admin, current_admin);
     assert_eq!(record.pending_admin, pending_admin);
 
-    // Pending admin accepts handover
+    // Pending admin accepts handover, once the #507 acceptance delay elapses.
+    env.ledger()
+        .set_timestamp(record.requested_at + ROLE_TRANSFER_ACCEPTANCE_DELAY);
     client.accept_admin_handover(&pending_admin);
 
     assert!(client.get_pending_admin_handover().is_none());

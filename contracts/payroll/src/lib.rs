@@ -480,6 +480,46 @@ pub struct PendingPayrollObligation {
     pub reservation_outstanding: bool,
 }
 
+// ---- Issue #507: Role transfer acceptance delay -----------------------------
+
+/// Minimum wait (in seconds) between *proposing* a privileged role transfer and
+/// *accepting* it in the payroll contract (#507).
+///
+/// A proposal is inert on its own, but a proposer whose key is compromised
+/// could otherwise hand the admin or treasury-owner role to an attacker and
+/// have it accepted in the same transaction. The delay gives the outgoing
+/// holder (and off-chain monitoring) a window to notice and cancel the
+/// proposal before the transferred role becomes active.
+///
+/// The value is a contract constant rather than stored policy: `DataKey` is
+/// already at the 50-variant ceiling of the Soroban contract-spec UDT union,
+/// so adding a key for a configurable delay would break contract generation.
+/// Operators who need a different window must ship a patched build; the
+/// cancel entrypoints remain available throughout, so a longer or shorter
+/// window never makes a pending transfer irreversible.
+pub const ROLE_TRANSFER_ACCEPTANCE_DELAY: u64 = 24 * 60 * 60;
+
+/// Privacy-safe view of a pending privileged role transfer (#507).
+///
+/// Only the role identifier, the two addresses already visible on the
+/// underlying `PendingRotation` / `PendingAdminHandover` record, and ledger
+/// timestamps are exposed -- never payroll values.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RoleTransferStatus {
+    /// Symbolic name of the role being transferred (`"admin"`,
+    /// `"treasury_owner"`, or `"admin_handover"`).
+    pub role: Symbol,
+    /// Address proposed to receive the role.
+    pub new_holder: Address,
+    /// Ledger timestamp the transfer was proposed/requested at.
+    pub proposed_at: u64,
+    /// Ledger timestamp from which the recipient may accept the transfer.
+    pub ready_at: u64,
+    /// Acceptance delay (in seconds) applied to this transfer.
+    pub delay_seconds: u64,
+}
+
 // ?? Issue #474: Payroll Run Expiration ?????????????????????????????????????
 
 /// Expiry policy for prepared-but-not-finalized payroll runs (#474).
@@ -3567,6 +3607,7 @@ impl Payroll {
             panic!("Unauthorized: caller is not the proposed admin");
         }
         new_admin.require_auth();
+        Self::require_role_transfer_delay_elapsed(&e, "admin", proposal.proposed_at);
         Self::require_no_active_payroll_run(&e);
 
         let mut addrs: ContractAddresses = e
@@ -3660,6 +3701,7 @@ impl Payroll {
             panic!("Unauthorized: caller is not the proposed treasury owner");
         }
         new_owner.require_auth();
+        Self::require_role_transfer_delay_elapsed(&e, "treasury_owner", proposal.proposed_at);
         Self::require_no_active_payroll_run(&e);
 
         let old_owner: Address = e
@@ -3726,6 +3768,96 @@ impl Payroll {
             .get(&DataKey::PendingTreasuryRotation)
     }
 
+    // ?? Issue #507: Role Transfer Acceptance Delay ?????????????????????????
+    //
+    // Every privileged role transfer in this contract is two-step: the current
+    // holder proposes a successor, and the successor must explicitly accept.
+    // #507 adds a mandatory waiting period between those two steps so a
+    // compromised proposer cannot transfer a privileged role and have it
+    // activated in the same transaction.
+
+    /// Ledger timestamp from which a transfer proposed at `proposed_at` may be
+    /// accepted (#507).
+    fn role_transfer_ready_at(proposed_at: u64) -> u64 {
+        proposed_at.saturating_add(ROLE_TRANSFER_ACCEPTANCE_DELAY)
+    }
+
+    /// Reject a privileged role transfer that is accepted before the
+    /// acceptance delay has elapsed (#507).
+    ///
+    /// Call this *after* the recipient identity check so an unauthorized
+    /// caller still receives the authorization error and cannot use this gate
+    /// as a transfer-status oracle. The panic message reports timing only and
+    /// never includes payroll values.
+    fn require_role_transfer_delay_elapsed(e: &Env, role: &str, proposed_at: u64) {
+        let ready_at = Self::role_transfer_ready_at(proposed_at);
+        let now = e.ledger().timestamp();
+        if now < ready_at {
+            panic!(
+                "Role transfer acceptance delayed: {} transfer becomes acceptable in {}s",
+                role,
+                ready_at - now
+            );
+        }
+    }
+
+    /// Build the privacy-safe status view for a pending rotation proposal.
+    fn role_transfer_status(role: Symbol, proposal: PendingRotation) -> RoleTransferStatus {
+        RoleTransferStatus {
+            role,
+            new_holder: proposal.new_holder,
+            proposed_at: proposal.proposed_at,
+            ready_at: Self::role_transfer_ready_at(proposal.proposed_at),
+            delay_seconds: ROLE_TRANSFER_ACCEPTANCE_DELAY,
+        }
+    }
+
+    /// Privacy-safe view of the pending admin role transfer (#507).
+    ///
+    /// `None` when no admin rotation is pending. Exposes only the role, the
+    /// already-public candidate address, and ledger timestamps.
+    pub fn get_admin_transfer_status(e: Env) -> Option<RoleTransferStatus> {
+        let proposal: PendingRotation = e
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminRotation)?;
+        Some(Self::role_transfer_status(
+            Symbol::new(&e, "admin"),
+            proposal,
+        ))
+    }
+
+    /// Privacy-safe view of the pending treasury-owner role transfer (#507).
+    ///
+    /// `None` when no treasury rotation is pending.
+    pub fn get_treasury_transfer_status(e: Env) -> Option<RoleTransferStatus> {
+        let proposal: PendingRotation = e
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingTreasuryRotation)?;
+        Some(Self::role_transfer_status(
+            Symbol::new(&e, "treasury_owner"),
+            proposal,
+        ))
+    }
+
+    /// Privacy-safe view of the pending admin handover (#507).
+    ///
+    /// `None` when no handover is pending.
+    pub fn get_handover_transfer_status(e: Env) -> Option<RoleTransferStatus> {
+        let handover: PendingAdminHandover = e
+            .storage()
+            .persistent()
+            .get(&DataKey::PendingAdminHandover)?;
+        Some(RoleTransferStatus {
+            role: Symbol::new(&e, "admin_handover"),
+            new_holder: handover.pending_admin,
+            proposed_at: handover.requested_at,
+            ready_at: Self::role_transfer_ready_at(handover.requested_at),
+            delay_seconds: ROLE_TRANSFER_ACCEPTANCE_DELAY,
+        })
+    }
+
     // ?? Issue #339: Admin Handover Safety Checks ?????????????????????????????
 
     /// Request a new admin handover requiring explicit acceptance (step 1 of 2 ? issue #339).
@@ -3770,6 +3902,8 @@ impl Payroll {
             panic!("Unauthorized: caller is not the pending admin");
         }
         pending_admin.require_auth();
+        Self::require_role_transfer_delay_elapsed(&e, "admin_handover", handover.requested_at);
+        Self::require_no_active_payroll_run(&e);
 
         let mut addrs: ContractAddresses = e
             .storage()
@@ -5986,6 +6120,11 @@ mod tests {
         assert_eq!(proposal.new_holder, new_admin);
         assert_eq!(proposal.proposed_by, admin);
 
+        // #507: the successor may only accept once the acceptance delay has
+        // elapsed since the proposal.
+        env.ledger()
+            .set_timestamp(proposal.proposed_at + ROLE_TRANSFER_ACCEPTANCE_DELAY);
+
         payroll_client.accept_admin_rotation(&new_admin);
 
         assert!(payroll_client.get_pending_admin_rotation().is_none());
@@ -6012,6 +6151,12 @@ mod tests {
 
         let new_admin = Address::generate(&env);
         payroll_client.propose_admin_rotation(&admin, &new_admin);
+
+        // #507: the recipient check runs before the acceptance-delay check, so
+        // an impostor still sees the authorization error even once the delay
+        // has elapsed and cannot probe the transfer status.
+        env.ledger()
+            .set_timestamp(ROLE_TRANSFER_ACCEPTANCE_DELAY * 2);
 
         let impostor = Address::generate(&env);
         payroll_client.accept_admin_rotation(&impostor);
@@ -6141,6 +6286,11 @@ mod tests {
             .get_pending_treasury_rotation()
             .expect("proposal should exist");
         assert_eq!(proposal.new_holder, new_owner);
+
+        // #507: the successor may only accept once the acceptance delay has
+        // elapsed since the proposal.
+        env.ledger()
+            .set_timestamp(proposal.proposed_at + ROLE_TRANSFER_ACCEPTANCE_DELAY);
 
         payroll_client.accept_treasury_rotation(&new_owner);
         assert!(payroll_client.get_pending_treasury_rotation().is_none());
@@ -7777,6 +7927,154 @@ mod tests {
     }
 
     // ============================================================================
+    // Issue #507: Role Transfer Acceptance Delay Tests
+    // ============================================================================
+
+    /// Happy path: a proposed role transfer cannot be accepted before the
+    /// acceptance delay elapses, and succeeds as soon as it does.
+    #[test]
+    fn test_role_transfer_acceptance_delay_blocks_early_accept() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let new_admin = Address::generate(&env);
+        payroll_client.propose_admin_rotation(&admin, &new_admin);
+
+        let status = payroll_client
+            .get_admin_transfer_status()
+            .expect("pending admin transfer should be visible");
+        assert_eq!(status.role, Symbol::new(&env, "admin"));
+        assert_eq!(status.new_holder, new_admin);
+        assert_eq!(status.delay_seconds, ROLE_TRANSFER_ACCEPTANCE_DELAY);
+        assert_eq!(
+            status.ready_at,
+            status.proposed_at + ROLE_TRANSFER_ACCEPTANCE_DELAY
+        );
+
+        // One second before the window opens the proposal is still pending.
+        env.ledger().set_timestamp(status.ready_at - 1);
+        let early = payroll_client.try_accept_admin_rotation(&new_admin);
+        assert!(
+            early.is_err(),
+            "accepting before the acceptance delay must fail"
+        );
+        assert!(
+            payroll_client.get_pending_admin_rotation().is_some(),
+            "a rejected accept must leave the proposal in place"
+        );
+
+        // Exactly at the window the recipient becomes the admin.
+        env.ledger().set_timestamp(status.ready_at);
+        payroll_client.accept_admin_rotation(&new_admin);
+        assert!(payroll_client.get_pending_admin_rotation().is_none());
+    }
+
+    /// Edge case: the delay is not an authorization bypass or a status oracle.
+    /// An impostor still gets the authorization error, even after the delay has
+    /// elapsed, and the failure message carries timing only -- never payroll
+    /// values.
+    #[test]
+    fn test_role_transfer_delay_does_not_bypass_authorization() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let new_admin = Address::generate(&env);
+        let impostor = Address::generate(&env);
+        payroll_client.propose_admin_rotation(&admin, &new_admin);
+
+        // Long past the window, but the caller is not the proposed admin.
+        env.ledger()
+            .set_timestamp(ROLE_TRANSFER_ACCEPTANCE_DELAY * 2);
+        assert!(
+            payroll_client.try_accept_admin_rotation(&impostor).is_err(),
+            "the delay must not weaken the recipient check"
+        );
+
+        // The rightful recipient still completes the transfer.
+        payroll_client.accept_admin_rotation(&new_admin);
+        assert!(payroll_client.get_pending_admin_rotation().is_none());
+    }
+
+    /// Edge case: a delayed transfer stays fully cancellable throughout the
+    /// waiting window, so an unwanted proposal never blocks the role forever.
+    #[test]
+    fn test_role_transfer_cancellable_during_delay() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (payroll_client, admin, _treasury, _treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let new_admin = Address::generate(&env);
+        payroll_client.propose_admin_rotation(&admin, &new_admin);
+
+        env.ledger()
+            .set_timestamp(ROLE_TRANSFER_ACCEPTANCE_DELAY - 1);
+        payroll_client.cancel_admin_rotation(&admin);
+
+        assert!(payroll_client.get_pending_admin_rotation().is_none());
+        assert!(payroll_client.get_admin_transfer_status().is_none());
+
+        // Even after the original window opens, the cancelled proposal can no
+        // longer be accepted.
+        env.ledger()
+            .set_timestamp(ROLE_TRANSFER_ACCEPTANCE_DELAY * 2);
+        assert!(
+            payroll_client
+                .try_accept_admin_rotation(&new_admin)
+                .is_err(),
+            "a cancelled transfer must not be acceptable"
+        );
+    }
+
+    /// The treasury-owner rotation and the admin handover honour the same delay.
+    #[test]
+    fn test_treasury_and_handover_transfers_honor_delay() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (payroll_client, admin, _treasury, treasury_owner, _employee) =
+            setup_simple_payroll(&env);
+
+        let new_owner = Address::generate(&env);
+        payroll_client.propose_treasury_rotation(&treasury_owner, &new_owner);
+        assert!(
+            payroll_client
+                .try_accept_treasury_rotation(&new_owner)
+                .is_err(),
+            "treasury rotation must also wait for the acceptance delay"
+        );
+
+        let pending_admin = Address::generate(&env);
+        payroll_client.request_admin_handover(&admin, &pending_admin);
+        assert!(
+            payroll_client
+                .try_accept_admin_handover(&pending_admin)
+                .is_err(),
+            "admin handover must also wait for the acceptance delay"
+        );
+
+        env.ledger().set_timestamp(ROLE_TRANSFER_ACCEPTANCE_DELAY);
+
+        let treasury_status = payroll_client
+            .get_treasury_transfer_status()
+            .expect("pending treasury transfer should be visible");
+        assert_eq!(treasury_status.role, Symbol::new(&env, "treasury_owner"));
+        assert_eq!(
+            treasury_status.delay_seconds,
+            ROLE_TRANSFER_ACCEPTANCE_DELAY
+        );
+
+        payroll_client.accept_treasury_rotation(&new_owner);
+        payroll_client.accept_admin_handover(&pending_admin);
+
+        assert!(payroll_client.get_pending_treasury_rotation().is_none());
+        assert!(payroll_client.get_pending_admin_handover().is_none());
+    }
+
+    // ============================================================================
     // Issue #339: Admin Handover Safety Checks Tests
     // ============================================================================
 
@@ -7798,7 +8096,10 @@ mod tests {
         assert_eq!(pending.current_admin, admin);
         assert_eq!(pending.pending_admin, new_admin);
 
-        // Step 2: New admin accepts handover
+        // Step 2: New admin accepts handover, once the #507 acceptance delay
+        // has elapsed since the request.
+        env.ledger()
+            .set_timestamp(pending.requested_at + ROLE_TRANSFER_ACCEPTANCE_DELAY);
         payroll_client.accept_admin_handover(&new_admin);
 
         assert!(payroll_client.get_pending_admin_handover().is_none());

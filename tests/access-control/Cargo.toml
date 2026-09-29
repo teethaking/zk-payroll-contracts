@@ -12,6 +12,10 @@ name = "admin_handover"
 path = "admin_handover.rs"
 
 [[test]]
+name = "role_transfer_delay"
+path = "role_transfer_delay.rs"
+
+[[test]]
 name = "withdrawal_guardrails"
 path = "withdrawal_guardrails.rs"
 

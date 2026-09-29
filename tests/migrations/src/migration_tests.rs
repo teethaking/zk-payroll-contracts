@@ -26,9 +26,10 @@
 mod migration_tests {
     use audit_module::AuditModuleClient;
     use payment_executor::PaymentExecutorClient;
-    use payroll::{PayrollClient, ReconciliationStatus};
+    use payroll::{PayrollClient, ReconciliationStatus, ROLE_TRANSFER_ACCEPTANCE_DELAY};
     use payroll_registry::{EmployeeStatus, PayrollRegistryClient};
     use salary_commitment::SalaryCommitmentContractClient;
+    use soroban_sdk::testutils::Ledger as _;
     use soroban_sdk::{Env, Vec};
 
     use crate::migration_helpers::{
@@ -643,7 +644,10 @@ mod migration_tests {
             "Rotation proposer must be preserved"
         );
 
-        // Accept the rotation after migration
+        // Accept the rotation after migration, once the #507 acceptance delay
+        // measured from the pre-migration proposal timestamp has elapsed.
+        env.ledger()
+            .set_timestamp(rotation.proposed_at + ROLE_TRANSFER_ACCEPTANCE_DELAY);
         payroll_client.accept_admin_rotation(&ctx.admin2);
 
         // Verify rotation was accepted

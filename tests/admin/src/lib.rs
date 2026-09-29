@@ -19,10 +19,10 @@
 
 #[cfg(test)]
 mod tests {
-    use payroll::{CompanyState, Payroll, PayrollClient};
+    use payroll::{CompanyState, Payroll, PayrollClient, ROLE_TRANSFER_ACCEPTANCE_DELAY};
     use proof_verifier::{ProofVerifier, ProofVerifierClient, VerificationKey};
     use salary_commitment::{SalaryCommitmentContract, SalaryCommitmentContractClient};
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
     use soroban_sdk::{Address, BytesN, Env, Symbol, Vec};
     use token::{Token, TokenClient};
 
@@ -169,6 +169,10 @@ mod tests {
         let new_admin = Address::generate(&env);
         payroll_client.propose_admin_rotation(&admin, &new_admin);
 
+        // Move past the #507 acceptance delay so this test exercises the run
+        // lock rather than the role-transfer delay.
+        env.ledger().set_timestamp(ROLE_TRANSFER_ACCEPTANCE_DELAY);
+
         prepare_a_run(&env, &payroll_client, &employee, 1);
 
         let result = payroll_client.try_accept_admin_rotation(&new_admin);
@@ -188,6 +192,9 @@ mod tests {
 
         let run_id = prepare_a_run(&env, &payroll_client, &employee, 1);
         payroll_client.cancel_payroll_run(&admin, &run_id, &Symbol::new(&env, "test"));
+
+        // The #507 acceptance delay must have elapsed as well.
+        env.ledger().set_timestamp(ROLE_TRANSFER_ACCEPTANCE_DELAY);
 
         payroll_client.accept_admin_rotation(&new_admin);
         assert!(payroll_client.get_pending_admin_rotation().is_none());
@@ -217,6 +224,10 @@ mod tests {
         let new_owner = Address::generate(&env);
         payroll_client.propose_treasury_rotation(&treasury_owner, &new_owner);
 
+        // Move past the #507 acceptance delay so this test exercises the run
+        // lock rather than the role-transfer delay.
+        env.ledger().set_timestamp(ROLE_TRANSFER_ACCEPTANCE_DELAY);
+
         prepare_a_run(&env, &payroll_client, &employee, 1);
 
         let result = payroll_client.try_accept_treasury_rotation(&new_owner);
@@ -236,6 +247,9 @@ mod tests {
 
         let run_id = prepare_a_run(&env, &payroll_client, &employee, 1);
         payroll_client.cancel_payroll_run(&admin, &run_id, &Symbol::new(&env, "test"));
+
+        // The #507 acceptance delay must have elapsed as well.
+        env.ledger().set_timestamp(ROLE_TRANSFER_ACCEPTANCE_DELAY);
 
         payroll_client.accept_treasury_rotation(&new_owner);
         assert!(payroll_client.get_pending_treasury_rotation().is_none());
